@@ -1,0 +1,21 @@
+# Voice CLI - Requisitos de dependencias
+
+# DEPENDENCIAS BÁSICAS (requeridas)
+openai-whisper>=20231117
+sounddevice>=0.4.6
+scipy>=1.11.0
+numpy>=1.24.0
+
+# DEPENDENCIAS PRO (opcionales)
+# Descomenta para instalar funcionalidades PRO
+# pynput>=1.7.6          # Para hotkeys globales
+# pyperclip>=1.8.2       # Para portapapeles automático
+
+# DEPENDENCIAS DEL SISTEMA
+# FFmpeg debe estar instalado en el sistema
+
+# Instalación básica:
+# pip install -r requirements.txt
+
+# Instalación PRO completa:
+# pip install openai-whisper sounddevice scipy numpy pynput pyperclip
