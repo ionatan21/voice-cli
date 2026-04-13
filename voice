@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""
+Voice CLI - Comando global para grabación y transcripción de audio
+Uso: voice <comando> [argumentos]
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+
+# Obtener directorio del script para imports relativos
+SCRIPT_DIR = Path(__file__).parent.absolute()
+CONFIG_FILE = SCRIPT_DIR / "voice_config.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+
+def load_config():
+    """Carga configuración persistente"""
+    default_config = {
+        "device_id": None,
+        "sample_rate": 44100,
+        "language": "es",
+        "model": "base"
+    }
+
+    try:
+        if CONFIG_FILE.exists():
+            import json
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                return {**default_config, **config}
+    except Exception:
+        pass
+
+    return default_config
+
+def save_config(config):
+    """Guarda configuración persistente"""
+    try:
+        import json
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def apply_audio_config():
+    """Aplica configuración de audio guardada"""
+    config = load_config()
+    if config["device_id"] is not None:
+        try:
+            import sounddevice as sd
+            sd.default.device[0] = config["device_id"]
+        except Exception:
+            pass
+
+# Importar módulos locales
+try:
+    from recorder import AudioRecorder
+    from transcriber import AudioTranscriber
+    try:
+        from hotkeys import HotkeyManager
+        HOTKEYS_AVAILABLE = True
+    except ImportError:
+        HOTKEYS_AVAILABLE = False
+
+    try:
+        import pyperclip
+        CLIPBOARD_AVAILABLE = True
+    except ImportError:
+        CLIPBOARD_AVAILABLE = False
+
+except ImportError as e:
+    print(f"Error: No se pudieron importar módulos necesarios: {e}")
+    print("Asegúrate de estar ejecutando desde el directorio correcto.")
+    sys.exit(1)
+
+def cmd_interactive():
+    """Modo interactivo (comportamiento original)"""
+    # Determinar si usar versión PRO
+    if HOTKEYS_AVAILABLE:
+        print("Iniciando Voice CLI PRO (modo interactivo)")
+        from main_pro import VoiceCLIPro
+        cli = VoiceCLIPro()
+        cli.run_interactive_pro()
+    else:
+        print("Iniciando Voice CLI (modo interactivo)")
+        from main import VoiceCLI
+        cli = VoiceCLI()
+        cli.run_interactive()
+
+def cmd_start(args):
+    """Iniciar grabación (versión limpia)"""
+    # Aplicar configuración guardada
+    apply_audio_config()
+
+    import sounddevice as sd
+    import numpy as np
+    from scipy.io.wavfile import write
+    import threading
+    import time
+    from pathlib import Path
+    import whisper
+    import os
+
+    print("Iniciando grabación...")
+
+    config = load_config()
+    model_name = config.get('model', 'base')
+    language = config.get('language', 'es')
+
+    # Variables de grabación
+    recording = False
+    audio_data = []
+    sample_rate = 44100
+
+    # Crear directorio de grabaciones
+    recordings_dir = Path("recordings")
+    recordings_dir.mkdir(exist_ok=True)
+
+    def audio_callback(indata, frames, time, status):
+        nonlocal audio_data
+        if recording:
+            if indata.dtype != np.float32:
+                if indata.dtype == np.int16:
+                    processed_data = indata.astype(np.float32) / 32768.0
+                else:
+                    processed_data = indata.astype(np.float32)
+            else:
+                processed_data = indata
+            audio_data.append(processed_data.copy())
+
+    def start_recording():
+        nonlocal recording, audio_data, sample_rate
+        try:
+            current_device = sd.default.device[0] if sd.default.device[0] is not None else 0
+            device_info = sd.query_devices(current_device)
+            device_sample_rate = int(device_info['default_samplerate'])
+            sample_rate = device_sample_rate
+        except:
+            pass
+
+        recording = True
+        audio_data = []
+
+        # Intentar configuraciones
+        configs = [(sample_rate, np.float32), (44100, np.float32), (48000, np.float32)]
+
+        for sr, dtype in configs:
+            try:
+                stream = sd.InputStream(
+                    samplerate=sr,
+                    channels=1,
+                    callback=audio_callback,
+                    blocksize=1024,
+                    dtype=dtype
+                )
+                stream.start()
+                sample_rate = sr
+                return stream
+            except:
+                continue
+        return None
+
+    def stop_recording_and_save(stream):
+        nonlocal recording, audio_data
+        recording = False
+        if stream:
+            stream.stop()
+            stream.close()
+
+        if not audio_data:
+            return None
+
+        audio_array = np.concatenate(audio_data, axis=0)
+        timestamp = int(time.time())
+        filename = f"recording_{timestamp}.wav"
+        filepath = recordings_dir / filename
+
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+        audio_normalized = (audio_array * 32767).astype(np.int16)
+
+        try:
+            write(str(filepath), sample_rate, audio_normalized)
+            return str(filepath)
+        except:
+            return None
+
+    def transcribe_clean(audio_file):
+        try:
+            # Cargar modelo silenciosamente
+            model = whisper.load_model(model_name)
+
+            result = model.transcribe(
+                audio_file,
+                language=language,
+                verbose=False
+            )
+
+            text = result["text"].strip()
+            if not text:
+                # Intentar sin idioma especificado
+                result = model.transcribe(audio_file, verbose=False)
+                text = result["text"].strip()
+
+            if text:
+                return {
+                    "text": text,
+                    "language": result.get("language", language),
+                    "transcription_time": 0  # No medimos tiempo para mantenerlo simple
+                }
+        except Exception:
+            pass
+        return None
+
+    # Iniciar grabación
+    print("Grabando... Presiona Enter para detener")
+
+    stream = start_recording()
+    if not stream:
+        print("Error: No se pudo iniciar la grabación")
+        print("Usa 'voice start-debug' para información detallada")
+        return
+
+    try:
+        input()
+        print("Deteniendo grabación...")
+
+        # Detener y guardar
+        audio_file = stop_recording_and_save(stream)
+        if not audio_file:
+            print("Error: No se pudo guardar el audio")
+            return
+
+        print("Realizando transcripción...")
+
+        # Transcribir
+        result = transcribe_clean(audio_file)
+
+        if result and result["text"]:
+            print(f"Idioma: {result['language']}")
+            print()
+            print("Transcripción:")
+            print(result["text"])
+
+            # Copiar al portapapeles
+            if CLIPBOARD_AVAILABLE:
+                try:
+                    import pyperclip
+                    pyperclip.copy(result["text"])
+                    print()
+                    print("Texto copiado al portapapeles")
+                except:
+                    pass
+        else:
+            print("Error: No se pudo transcribir el audio")
+            print("Usa 'voice start-debug' para diagnóstico detallado")
+
+    except KeyboardInterrupt:
+        print("\nCancelado por el usuario")
+        recording = False
+        if stream:
+            stream.stop()
+            stream.close()
+
+def cmd_start_debug(args):
+    """Iniciar grabación (versión detallada para diagnóstico)"""
+    # Aplicar configuración guardada
+    apply_audio_config()
+
+    from main import VoiceCLI
+    cli = VoiceCLI()
+
+    print("Voice CLI - Modo diagnóstico")
+    print("=" * 50)
+    print("Grabación iniciada...")
+    cli.cmd_start([])
+
+    if cli.recorder.is_recording():
+        print("Presiona Enter para detener la grabación...")
+        try:
+            input()
+            cli.cmd_stop([])
+        except KeyboardInterrupt:
+            print("\nDeteniendo grabación...")
+            cli.cmd_stop([])
+
+def cmd_stop(args):
+    """Apenas para completar, pero no es muy útil como comando global"""
+    print("Error: 'voice stop' solo funciona en modo interactivo")
+    print("Usa 'voice start' que permite detener con Enter")
+
+def cmd_transcribe(args):
+    """Transcribir archivo específico"""
+    if not args.file:
+        print("Error: Especifica un archivo")
+        print("Uso: voice transcribe <archivo.wav>")
+        return
+
+    if not os.path.exists(args.file):
+        print(f"Error: Archivo no encontrado: {args.file}")
+        return
+
+    # Inicializar transcriptor
+    model = getattr(args, 'model', 'base')
+    language = getattr(args, 'language', 'es')
+
+    transcriber = AudioTranscriber(model_name=model, default_language=language)
+
+    print(f"Transcribiendo: {args.file}")
+    result = transcriber.transcribe_file(args.file, language=language)
+
+    if result and result["text"]:
+        print("\nTranscripción:")
+        print("-" * 50)
+        print(result["text"])
+        print("-" * 50)
+        print(f"Idioma: {result['language']}")
+        print(f"Tiempo: {result['transcription_time']:.2f}s")
+
+        # Copiar al portapapeles si está disponible
+        if CLIPBOARD_AVAILABLE:
+            try:
+                pyperclip.copy(result["text"])
+                print("Texto copiado al portapapeles")
+            except:
+                pass
+    else:
+        print("Error: No se pudo transcribir el archivo")
+
+def cmd_batch(args):
+    """Transcribir lote de archivos"""
+    if not args.directory:
+        print("Error: Especifica un directorio")
+        print("Uso: voice batch <directorio>")
+        return
+
+    directory = Path(args.directory)
+    if not directory.exists() or not directory.is_dir():
+        print(f"Error: Directorio no válido: {directory}")
+        return
+
+    # Buscar archivos de audio
+    audio_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.aac']
+    audio_files = []
+
+    for ext in audio_extensions:
+        audio_files.extend(directory.glob(f"*{ext}"))
+
+    if not audio_files:
+        print(f"Error: No se encontraron archivos de audio en: {directory}")
+        return
+
+    # Inicializar transcriptor
+    model = getattr(args, 'model', 'base')
+    language = getattr(args, 'language', 'es')
+
+    transcriber = AudioTranscriber(model_name=model, default_language=language)
+
+    print(f"Transcribiendo {len(audio_files)} archivos...")
+
+    results = []
+    for i, file_path in enumerate(audio_files, 1):
+        print(f"\n[{i}/{len(audio_files)}] {file_path.name}")
+
+        try:
+            result = transcriber.transcribe_file(str(file_path), language=language)
+            if result and result["text"]:
+                results.append({
+                    'file': file_path.name,
+                    'text': result['text'],
+                    'language': result['language']
+                })
+                print(f"  Texto: {result['text'][:100]}...")
+            else:
+                print("  Error en transcripción")
+        except Exception as e:
+            print(f"  Error: {e}")
+
+    # Guardar resumen
+    if results:
+        summary_file = directory / "transcription_summary.txt"
+        with open(summary_file, "w", encoding="utf-8") as f:
+            f.write("TRANSCRIPCIÓN POR LOTES\n")
+            f.write("=" * 50 + "\n\n")
+
+            for result in results:
+                f.write(f"Archivo: {result['file']}\n")
+                f.write(f"Idioma: {result['language']}\n")
+                f.write(f"Texto: {result['text']}\n")
+                f.write("-" * 40 + "\n\n")
+
+        print(f"\nResumen guardado en: {summary_file}")
+        print(f"Transcripciones exitosas: {len(results)}/{len(audio_files)}")
+
+def cmd_devices(args):
+    """Listar dispositivos de audio"""
+    import sounddevice as sd
+
+    print("Dispositivos de audio disponibles:")
+    print("-" * 50)
+
+    devices = sd.query_devices()
+    for i, device in enumerate(devices):
+        device_type = []
+        if device['max_input_channels'] > 0:
+            device_type.append('INPUT')
+        if device['max_output_channels'] > 0:
+            device_type.append('OUTPUT')
+
+        default_mark = " (DEFAULT)" if i == sd.default.device[0] else ""
+        print(f"  {i}: {device['name']}")
+        print(f"     Tipo: {'/'.join(device_type)}{default_mark}")
+        print(f"     Sample rate: {device['default_samplerate']} Hz")
+        print()
+
+def cmd_record(args):
+    """Grabación directa con duración específica"""
+    # Aplicar configuración guardada
+    apply_audio_config()
+
+    import sounddevice as sd
+    import numpy as np
+    from scipy.io.wavfile import write
+    import time
+
+    duration = getattr(args, 'duration', 10)  # 10 segundos por defecto
+
+    # Obtener configuración
+    config = load_config()
+    device_id = config.get("device_id")
+
+    if device_id is not None:
+        print(f"Usando dispositivo configurado: {device_id}")
+    else:
+        print("Usando dispositivo por defecto")
+
+    print(f"Grabando por {duration} segundos...")
+
+    try:
+        # Grabación directa
+        sample_rate = 44100
+        audio_data = sd.rec(
+            int(duration * sample_rate),
+            samplerate=sample_rate,
+            channels=1,
+            device=device_id,
+            dtype='float64'
+        )
+
+        print("GRABANDO... Habla ahora!")
+        sd.wait()
+
+        # Verificar y guardar
+        max_level = np.max(np.abs(audio_data))
+        if max_level > 0.001:
+            print(f"Audio grabado (nivel: {max_level:.3f})")
+
+            # Guardar archivo
+            timestamp = int(time.time())
+            filename = f"voice_record_{timestamp}.wav"
+
+            recordings_dir = Path("recordings")
+            recordings_dir.mkdir(exist_ok=True)
+            filepath = recordings_dir / filename
+
+            audio_normalized = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
+            write(str(filepath), sample_rate, audio_normalized)
+
+            print(f"Archivo guardado: {filepath}")
+
+            # Auto-transcribir si se especifica
+            if getattr(args, 'transcribe', False):
+                print("\nTranscribiendo automáticamente...")
+                # Simular args para transcribe
+                class TranscribeArgs:
+                    def __init__(self, file):
+                        self.file = file
+                        self.model = getattr(args, 'model', 'base')
+                        self.language = getattr(args, 'language', 'es')
+
+                cmd_transcribe(TranscribeArgs(str(filepath)))
+        else:
+            print("Error: No se detectó audio")
+            print("Verifica la configuración del dispositivo:")
+            print("1. voice devices  # Ver dispositivos")
+            print("2. voice device <id>  # Cambiar dispositivo")
+            print("3. voice test  # Probar dispositivo")
+
+    except Exception as e:
+        print(f"Error durante grabación: {e}")
+        print("Verifica la configuración del dispositivo con: voice test")
+
+def cmd_device(args):
+    """Cambiar dispositivo de audio"""
+    if not hasattr(args, 'device_id') or args.device_id is None:
+        # Mostrar dispositivos actuales
+        config = load_config()
+        print(f"Dispositivo configurado: {config['device_id']}")
+        print("\nDispositivos disponibles:")
+        cmd_devices(args)
+        return
+
+    import sounddevice as sd
+
+    try:
+        device_id = int(args.device_id)
+        device_info = sd.query_devices(device_id)
+
+        if device_info['max_input_channels'] == 0:
+            print(f"Error: El dispositivo {device_id} no es de entrada")
+            return
+
+        # Cambiar dispositivo por defecto
+        sd.default.device[0] = device_id
+
+        # Guardar configuración
+        config = load_config()
+        config["device_id"] = device_id
+        if save_config(config):
+            print(f"Dispositivo cambiado y guardado: {device_info['name']}")
+        else:
+            print(f"Dispositivo cambiado (solo esta sesión): {device_info['name']}")
+
+        print(f"ID: {device_id}")
+        print(f"Canales: {device_info['max_input_channels']}")
+        print(f"Sample rate: {device_info['default_samplerate']} Hz")
+
+    except ValueError:
+        print("Error: ID de dispositivo debe ser un número")
+    except Exception as e:
+        print(f"Error configurando dispositivo: {e}")
+
+def cmd_test(args):
+    """Probar dispositivo de audio"""
+    import sounddevice as sd
+    import numpy as np
+
+    # Aplicar configuración guardada
+    apply_audio_config()
+
+    device_id = getattr(args, 'device_id', None)
+
+    if device_id is not None:
+        try:
+            device_id = int(device_id)
+        except ValueError:
+            print("Error: ID de dispositivo debe ser un número")
+            return
+    else:
+        # Usar dispositivo configurado o por defecto
+        config = load_config()
+        if config["device_id"] is not None:
+            device_id = config["device_id"]
+            print(f"Usando dispositivo configurado: {device_id}")
+        else:
+            device_id = sd.default.device[0]
+            print(f"Usando dispositivo por defecto: {device_id}")
+
+    try:
+        device_info = sd.query_devices(device_id)
+        print(f"Probando dispositivo {device_id}: {device_info['name']}")
+        print(f"Canales entrada: {device_info['max_input_channels']}")
+        print(f"Sample rate: {device_info['default_samplerate']} Hz")
+
+        if device_info['max_input_channels'] == 0:
+            print("Error: Este dispositivo no tiene entrada de audio")
+            return
+
+        # Probar grabación corta
+        print("Probando grabación por 2 segundos... ¡HABLA AHORA!")
+
+        test_data = []
+        def test_callback(indata, frames, time, status):
+            test_data.append(indata.copy())
+
+        with sd.InputStream(
+            device=device_id,
+            samplerate=int(device_info['default_samplerate']),
+            channels=1,
+            callback=test_callback,
+            blocksize=1024,
+            dtype=np.float32
+        ):
+            sd.sleep(2000)  # 2 segundos
+
+        if test_data:
+            audio_data = np.concatenate(test_data)
+            max_level = np.max(np.abs(audio_data))
+            rms_level = np.sqrt(np.mean(audio_data ** 2))
+
+            print(f"Nivel máximo: {max_level:.4f}")
+            print(f"Nivel RMS: {rms_level:.4f}")
+
+            if max_level > 0.001:
+                print("✓ DISPOSITIVO FUNCIONAL - Audio detectado correctamente")
+                silence_percentage = (np.sum(np.abs(audio_data) < 0.001) / len(audio_data)) * 100
+                print(f"Contenido de voz: {100-silence_percentage:.1f}%")
+            else:
+                print("❌ No se detectó audio")
+                print("- Verifica que el micrófono esté conectado")
+                print("- Aumenta el volumen del micrófono")
+                print("- Habla más cerca del micrófono")
+        else:
+            print("❌ No se recibieron datos de audio")
+
+    except Exception as e:
+        print(f"Error probando dispositivo: {e}")
+
+def cmd_language(args):
+    """Cambiar idioma por defecto"""
+    if not hasattr(args, 'language_code') or args.language_code is None:
+        print("Idiomas disponibles:")
+        languages = {
+            'es': 'Español', 'en': 'English', 'fr': 'Français', 'de': 'Deutsch',
+            'it': 'Italiano', 'pt': 'Português', 'ru': 'Русский', 'ja': '日本語',
+            'ko': '한국어', 'zh': '中文', 'ar': 'العربية', 'hi': 'हिन्दी'
+        }
+        for code, name in languages.items():
+            print(f"  {code}: {name}")
+        print("\nUso: voice language <código>")
+        return
+
+    language = args.language_code.lower()
+    print(f"Idioma configurado: {language}")
+    print("Nota: Esta configuración se aplica solo a esta sesión")
+    print("Para cambio permanente, usa el modo interactivo: voice")
+
+def cmd_sample_rate(args):
+    """Cambiar sample rate"""
+    if not hasattr(args, 'rate') or args.rate is None:
+        config = load_config()
+        print(f"Sample rate actual: {config.get('sample_rate', 44100)} Hz")
+        print("Sample rates comunes:")
+        print("  8000    - Telefonía")
+        print("  16000   - Voz de baja calidad")
+        print("  22050   - Radio AM")
+        print("  44100   - CD Audio (estándar)")
+        print("  48000   - Audio profesional")
+        print("  96000   - Audio de alta resolución")
+        print("\nUso: voice sample-rate <hz>")
+        return
+
+    try:
+        rate = int(args.rate)
+        if rate < 8000 or rate > 192000:
+            print("Error: Sample rate debe estar entre 8000 y 192000 Hz")
+            return
+
+        # Guardar configuración
+        config = load_config()
+        config["sample_rate"] = rate
+        if save_config(config):
+            print(f"Sample rate guardado: {rate} Hz")
+        else:
+            print(f"Sample rate configurado (solo esta sesión): {rate} Hz")
+
+    except ValueError:
+        print("Error: Sample rate debe ser un número")
+
+def cmd_reset_config(args):
+    """Resetear configuración a valores por defecto"""
+    try:
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+            print("Configuración reseteada a valores por defecto")
+        else:
+            print("No hay configuración guardada")
+    except Exception as e:
+        print(f"Error reseteando configuración: {e}")
+
+def cmd_config(args):
+    """Mostrar configuración actual"""
+    import sounddevice as sd
+
+    print("Configuración de Voice CLI:")
+    print("-" * 30)
+    print(f"Directorio de trabajo: {SCRIPT_DIR}")
+    print(f"Archivo de configuración: {CONFIG_FILE}")
+    print(f"Hotkeys disponibles: {'Sí' if HOTKEYS_AVAILABLE else 'No'}")
+    print(f"Portapapeles disponible: {'Sí' if CLIPBOARD_AVAILABLE else 'No'}")
+
+    # Configuración guardada
+    config = load_config()
+    print(f"\nConfiguración guardada:")
+    print(f"  Dispositivo ID: {config.get('device_id', 'No configurado')}")
+    print(f"  Sample rate: {config.get('sample_rate', 44100)} Hz")
+    print(f"  Idioma: {config.get('language', 'es')}")
+    print(f"  Modelo: {config.get('model', 'base')}")
+
+    # Configuración de audio actual
+    try:
+        apply_audio_config()
+        current_device = sd.default.device[0]
+        device_info = sd.query_devices(current_device)
+        print(f"\nDispositivo actual aplicado:")
+        print(f"  ID: {current_device}")
+        print(f"  Nombre: {device_info['name']}")
+        print(f"  Canales: {device_info['max_input_channels']}")
+        print(f"  Sample rate: {device_info['default_samplerate']} Hz")
+    except Exception as e:
+        print(f"\nDispositivo de audio: Error - {e}")
+
+    # Verificar archivos
+    files_to_check = ['recorder.py', 'transcriber.py', 'main.py']
+    print("\nArchivos del sistema:")
+    for file in files_to_check:
+        file_path = SCRIPT_DIR / file
+        status = "OK" if file_path.exists() else "FALTA"
+        print(f"  {file}: {status}")
+
+def cmd_install(args):
+    """Instalar Voice CLI globalmente"""
+    print("Para instalar Voice CLI globalmente:")
+    print("1. Ejecuta: python installer.py")
+    print("2. Reinicia tu terminal")
+    print("3. Ya podrás usar 'voice' desde cualquier lugar")
+
+def cmd_help(args=None):
+    """Mostrar ayuda detallada"""
+    help_text = """
+Voice CLI - Transcripción de audio con Whisper
+
+COMANDOS PRINCIPALES:
+  voice                     Modo interactivo (recomendado)
+  voice start               Grabación limpia (sin información técnica)
+  voice start-debug         Grabación con información detallada
+  voice transcribe <file>   Transcribir archivo específico
+  voice batch <dir>         Transcribir lote de archivos
+  voice record [opts]       Grabación con duración fija
+
+COMANDOS DE CONFIGURACIÓN:
+  voice devices             Listar dispositivos de audio
+  voice device <id>         Cambiar dispositivo de audio
+  voice test [<id>]         Probar dispositivo actual o específico
+  voice language [<code>]   Ver/configurar idioma (es, en, fr, etc.)
+  voice sample-rate [<hz>]  Ver/configurar frecuencia de muestreo
+
+COMANDOS DE INFORMACIÓN:
+  voice config              Mostrar configuración
+  voice help                Mostrar esta ayuda
+  voice version             Mostrar versión
+  voice install             Información de instalación
+
+OPCIONES GLOBALES:
+  --model, -m MODEL         Modelo Whisper (tiny/base/small/medium/large)
+  --language, -l LANG       Idioma (es/en/fr/de/etc.)
+  --sample-rate, -sr RATE   Frecuencia de muestreo
+
+EJEMPLOS:
+  voice devices                            # Ver dispositivos disponibles
+  voice device 5                           # Cambiar a dispositivo 5
+  voice test                               # Probar dispositivo actual
+  voice start                              # Grabación limpia
+  voice start-debug                        # Grabación con detalles técnicos
+  voice transcribe audio.wav -l en         # Transcribir en inglés
+
+CONFIGURACIÓN DE DISPOSITIVOS:
+1. voice devices          # Ver lista de dispositivos
+2. voice device 3         # Cambiar al dispositivo ID 3
+3. voice test             # Verificar que funciona
+4. voice start            # Grabación limpia
+
+DIFERENCIA ENTRE START Y START-DEBUG:
+- voice start:       Salida limpia, solo lo esencial
+- voice start-debug: Información técnica completa, diagnósticos
+
+MODO INTERACTIVO:
+Para acceso completo a todas las funciones, usa 'voice' sin argumentos.
+Esto iniciará el modo interactivo con todos los comandos disponibles.
+"""
+    print(help_text)
+
+def cmd_version(args=None):
+    """Mostrar versión"""
+    print("Voice CLI v1.0")
+    print("Transcripción de audio con OpenAI Whisper")
+
+def main():
+    """Función principal del comando global"""
+
+    # Parser principal
+    parser = argparse.ArgumentParser(
+        prog='voice',
+        description='Voice CLI - Transcripción de audio con Whisper',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    # Argumentos globales
+    parser.add_argument('--model', '-m', default='base',
+                       choices=['tiny', 'base', 'small', 'medium', 'large'],
+                       help='Modelo de Whisper (default: base)')
+
+    parser.add_argument('--language', '-l', default='es',
+                       help='Idioma para transcripción (default: es)')
+
+    parser.add_argument('--sample-rate', '-sr', type=int, default=44100,
+                       help='Frecuencia de muestreo (default: 44100)')
+
+    # Subcomandos
+    subparsers = parser.add_subparsers(dest='command', help='Comandos disponibles')
+
+    # Comando transcribe
+    transcribe_parser = subparsers.add_parser('transcribe', help='Transcribir archivo')
+    transcribe_parser.add_argument('file', help='Archivo de audio a transcribir')
+
+    # Comando batch
+    batch_parser = subparsers.add_parser('batch', help='Transcribir lote')
+    batch_parser.add_argument('directory', help='Directorio con archivos de audio')
+
+    # Comando record
+    record_parser = subparsers.add_parser('record', help='Grabación con duración')
+    record_parser.add_argument('--duration', '-d', type=int, default=10,
+                              help='Duración en segundos (default: 10)')
+    record_parser.add_argument('--transcribe', '-t', action='store_true',
+                              help='Transcribir automáticamente después de grabar')
+
+    # Comando device
+    device_parser = subparsers.add_parser('device', help='Cambiar dispositivo de audio')
+    device_parser.add_argument('device_id', nargs='?', type=int,
+                              help='ID del dispositivo (sin ID muestra lista)')
+
+    # Comando test
+    test_parser = subparsers.add_parser('test', help='Probar dispositivo de audio')
+    test_parser.add_argument('device_id', nargs='?', type=int,
+                            help='ID del dispositivo a probar (opcional)')
+
+    # Comando language
+    language_parser = subparsers.add_parser('language', help='Configurar idioma')
+    language_parser.add_argument('language_code', nargs='?',
+                                help='Código de idioma (es, en, fr, etc.)')
+
+    # Comando sample-rate
+    rate_parser = subparsers.add_parser('sample-rate', help='Configurar sample rate')
+    rate_parser.add_argument('rate', nargs='?', type=int,
+                            help='Frecuencia en Hz (ej: 48000)')
+
+    # Comando start-debug
+    subparsers.add_parser('start-debug', help='Grabación con información detallada')
+
+    # Comandos simples
+    subparsers.add_parser('start', help='Iniciar grabación (modo limpio)')
+    subparsers.add_parser('stop', help='Detener grabación (solo modo interactivo)')
+    subparsers.add_parser('devices', help='Listar dispositivos de audio')
+    subparsers.add_parser('config', help='Mostrar configuración')
+    subparsers.add_parser('install', help='Información de instalación')
+    subparsers.add_parser('help', help='Mostrar ayuda detallada')
+    subparsers.add_parser('version', help='Mostrar versión')
+
+    # Parse de argumentos
+    args = parser.parse_args()
+
+    # Mapeo de comandos
+    commands = {
+        'transcribe': cmd_transcribe,
+        'batch': cmd_batch,
+        'record': cmd_record,
+        'start': cmd_start,
+        'start-debug': cmd_start_debug,
+        'stop': cmd_stop,
+        'device': cmd_device,
+        'test': cmd_test,
+        'language': cmd_language,
+        'sample-rate': cmd_sample_rate,
+        'reset-config': cmd_reset_config,
+        'devices': cmd_devices,
+        'config': cmd_config,
+        'install': cmd_install,
+        'help': cmd_help,
+        'version': cmd_version,
+    }
+
+    # Ejecutar comando
+    if args.command in commands:
+        try:
+            commands[args.command](args)
+        except KeyboardInterrupt:
+            print("\nOperación cancelada por el usuario")
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+    else:
+        # Sin comando o comando no reconocido = modo interactivo
+        if args.command is None:
+            cmd_interactive()
+        else:
+            print(f"Comando desconocido: {args.command}")
+            cmd_help()
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
